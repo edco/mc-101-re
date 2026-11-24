@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "shared",
+    "core0",
+]
+exclude = ["xtask"]
+
+[profile.dev]
+opt-level = 1
+panic = "abort"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

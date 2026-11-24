@@ -1,0 +1,19 @@
+[package]
+name = "mc1r1-core0"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+
+[dependencies]
+mc1r1-shared = { path = "../shared" }
+critical-section = { version = "1.2.0", features = ["restore-state-bool"] }
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
+embassy-futures = "0.1.2"
+embassy-sync = "0.8.0"
+embassy-time = { version = "0.5.1", features = ["tick-hz-1_000", "generic-queue-16"] }
+embassy-time-driver = { version = "0.2.2", features = ["tick-hz-1_000"] }
+embassy-time-queue-utils = "0.3.0"
+embassy-usb = { version = "0.6.0", default-features = false }
+embassy-usb-driver = "0.2.2"
+embedded-sdmmc = { version = "0.10.0", default-features = false }
+static_cell = "2.1.1"

@@ -1,0 +1,8 @@
+[package]
+name = "mc1r1-core1"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+
+[dependencies]
+mc1r1-shared = { path = "../shared" }
