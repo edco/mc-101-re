@@ -48,7 +48,8 @@ use display::{LcdCh7, COLS};
 use fs::{probe_fat_volume, FatVolumeSummary, FsError};
 use hal::{BlockDevice, Peripherals, TextDisplay};
 use msc::{
-    is_usb_configured, set_storage_mode, AsyncMsc, MscControlHandler, SharedSd, StorageMode,
+    is_media_ejected, is_usb_configured, set_storage_mode, AsyncMsc, MscControlHandler, SharedSd,
+    StorageMode,
 };
 use panel::{button, button_name, PanelCh4, PanelEvent};
 use power::PowerCtl;
@@ -436,21 +437,41 @@ async fn usb_msc_task(usb: UsbDevice, sd: SdCard, mb: u32) {
 
     let monitor = async {
         let mut was_configured = false;
+        let mut was_ejected = false;
         loop {
             if SHUTDOWN_REQ.load(Ordering::Acquire) {
                 break;
             }
-            let cfg_now = is_usb_configured();
-            if cfg_now && !was_configured {
+            let cfg_now = is_usb_configured() && !usb::is_suspended();
+            let ej_now = is_media_ejected();
+            if cfg_now && (!was_configured || (was_ejected && !ej_now)) {
                 was_configured = true;
-                let line = fmt_sd_usb_status(mb, usb::is_high_speed(), READ_ONLY);
+                was_ejected = ej_now;
+                let line = if ej_now {
+                    *b"USB: EJECTED    "
+                } else {
+                    fmt_sd_usb_status(mb, usb::is_high_speed(), READ_ONLY)
+                };
                 let _ = DISPLAY_CH.try_send(DisplayCmd::WriteLine {
                     row: 1,
                     len: COLS,
                     buf: line,
                 });
+            } else if cfg_now && ej_now && !was_ejected {
+                was_ejected = true;
+                let _ = DISPLAY_CH.try_send(DisplayCmd::WriteLine {
+                    row: 1,
+                    len: COLS,
+                    buf: *b"USB: EJECTED    ",
+                });
             } else if !cfg_now && was_configured {
                 was_configured = false;
+                was_ejected = ej_now;
+                let _ = DISPLAY_CH.try_send(DisplayCmd::WriteLine {
+                    row: 1,
+                    len: COLS,
+                    buf: *b"USB: DETACHED   ",
+                });
             }
             Timer::after_millis(20).await;
         }
@@ -461,6 +482,7 @@ async fn usb_msc_task(usb: UsbDevice, sd: SdCard, mb: u32) {
             set_storage_mode(StorageMode::Firmware);
             {
                 let mut sd_guard = sd_mutex.lock().await;
+                sd_guard.abort_dma();
                 let _ = sd_guard.flush();
             }
             usb::force_disconnect();

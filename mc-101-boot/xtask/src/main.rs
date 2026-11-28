@@ -387,8 +387,25 @@ fn run_cmd(cmd: &mut Command) -> Result<(), String> {
     Ok(())
 }
 
+fn find_sysroot_rust_objcopy() -> Option<PathBuf> {
+    let sysroot_out = Command::new("rustc").args(["--print", "sysroot"]).output().ok()?;
+    if !sysroot_out.status.success() {
+        return None;
+    }
+    let sysroot = String::from_utf8_lossy(&sysroot_out.stdout).trim().to_string();
+    let rustlib = Path::new(&sysroot).join("lib").join("rustlib");
+    let entries = fs::read_dir(rustlib).ok()?;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join("bin").join("rust-objcopy");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn objcopy_bin(elf: &Path, out: &Path) -> Result<(), String> {
-    for tool in ["arm-none-eabi-objcopy", "llvm-objcopy", "rust-objcopy"] {
+    for tool in ["rust-objcopy", "llvm-objcopy", "arm-none-eabi-objcopy"] {
         if let Ok(status) = Command::new(tool)
             .args(["-O", "binary"])
             .arg(elf)
@@ -401,7 +418,19 @@ fn objcopy_bin(elf: &Path, out: &Path) -> Result<(), String> {
             return Err(format!("{tool} exited with {status}"));
         }
     }
-    Err("no objcopy tool found (tried arm-none-eabi-objcopy, llvm-objcopy, rust-objcopy)".into())
+    if let Some(sysroot_tool) = find_sysroot_rust_objcopy() {
+        let status = Command::new(&sysroot_tool)
+            .args(["-O", "binary"])
+            .arg(elf)
+            .arg(out)
+            .status()
+            .map_err(|e| format!("run {}: {e}", sysroot_tool.display()))?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(format!("{} exited with {status}", sysroot_tool.display()));
+    }
+    Err("no objcopy tool found (tried rust-objcopy, llvm-objcopy, arm-none-eabi-objcopy, and sysroot rust-objcopy)".into())
 }
 
 #[cfg(test)]

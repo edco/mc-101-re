@@ -21,7 +21,7 @@ SECTIONS
     .entry 0x00FFFF00 :
     {
         KEEP(*(.text.entry))
-        . = 0x100;
+        . = ORIGIN(STUB) + 0x100;
     } > STUB
 
     .itcm 0x01000000 :

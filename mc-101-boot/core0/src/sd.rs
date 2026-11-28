@@ -52,10 +52,6 @@ pub unsafe extern "C" fn SD_DMA_IRQ_Handler() {
         }
         SD_DMA_DONE.store(true, Ordering::Release);
         SD_DMA_WAKER.wake();
-    } else {
-        // Guard against an unacknowledged IRQ 34 storm freezing Core 0.
-        wr32(NVIC_ICER1, 1u32 << (SD_DMA_IRQ_NUM - 32));
-        dsb();
     }
 }
 
@@ -583,6 +579,7 @@ impl SdCard {
         wr32(DMAC0_CH3_EXT + 0x04, 0);
         wr32(DMAC0_CH3_EXT + 0x08, 0);
         dsb();
+        core::ptr::write_volatile(NVIC_ISER1 as *mut u32, 1u32 << (SD_DMA_IRQ_NUM - 32));
         wr32(DMAC0_CH3 + 0x00, rd32(DMAC0_CH3 + 0x00) | 0x8000_0000);
         dsb();
     }
@@ -591,6 +588,48 @@ impl SdCard {
         wr32(DMAC0_CH3 + 0x00, rd32(DMAC0_CH3 + 0x00) & !0xA000_0000);
         wr32(CC_EXT_MODE, rd32(CC_EXT_MODE) & !2);
         dsb();
+    }
+
+    /// Abort any in-flight SDHI/DMAC0 CH3 transfer (called before teardown/flush).
+    pub fn abort_dma(&self) {
+        // SAFETY: Exclusive SDHI/DMAC0 CH3 ownership via SharedSd mutex.
+        unsafe {
+            self.stop_sd_dma();
+            wr32(SD_STOP, 0x0101);
+            let _ = self.wait_not_busy();
+        }
+    }
+
+    async fn wait_sd_dma_done(&self, timeout_ms: u64) -> bool {
+        let deadline = time::now_ms().wrapping_add(timeout_ms);
+        loop {
+            let dma_wait = poll_fn(|cx| {
+                SD_DMA_WAKER.register(cx.waker());
+                if SD_DMA_DONE.load(Ordering::Acquire) {
+                    return Poll::Ready(());
+                }
+                // SAFETY: Poll DMAC0 CH3 completion bits in case IRQ 34 was masked/missed.
+                unsafe {
+                    let cfg = rd32(DMAC0_CH3 + 0x04);
+                    let st = cfg & 0x70000;
+                    if st != 0 {
+                        wr32(DMAC0_CH3 + 0x04, cfg & !0x70000);
+                        if st != 0x50000 {
+                            SD_DMA_ERR.store((st >> 16) as u8, Ordering::Release);
+                        }
+                        SD_DMA_DONE.store(true, Ordering::Release);
+                        return Poll::Ready(());
+                    }
+                }
+                Poll::Pending
+            });
+            if matches!(select(dma_wait, Timer::after_millis(10)).await, Either::First(())) {
+                return true;
+            }
+            if time::now_ms() >= deadline {
+                return false;
+            }
+        }
     }
 
     /// Async multi-block DMA read into a 32-byte-aligned SDRAM/SRAM slice (`buf.len()` must be a
@@ -623,16 +662,8 @@ impl SdCard {
             }
         }
 
-        // Await IRQ 34 (DMAC0 CH3 completion) with a 2 s safety timeout.
-        let dma_wait = poll_fn(|cx| {
-            SD_DMA_WAKER.register(cx.waker());
-            if SD_DMA_DONE.load(Ordering::Acquire) {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        });
-        if matches!(select(dma_wait, Timer::after_millis(2000)).await, Either::Second(())) {
+        // Await IRQ 34 (DMAC0 CH3 completion) with a 2 s safety timeout + polling fallback.
+        if !self.wait_sd_dma_done(2000).await {
             unsafe {
                 self.stop_sd_dma();
                 wr32(SD_STOP, 0x0101);
@@ -641,16 +672,16 @@ impl SdCard {
             return Err(SdError::Timeout);
         }
 
+        let err_code = SD_DMA_ERR.load(Ordering::Acquire);
+        let deadline = time::now_ms().wrapping_add(500);
+        while unsafe { (rd32(SD_INFO1) & INFO1_ACCESS_END) == 0 } {
+            if time::now_ms() >= deadline {
+                return Err(SdError::Timeout);
+            }
+            embassy_futures::yield_now().await;
+        }
         unsafe {
             self.stop_sd_dma();
-            let err_code = SD_DMA_ERR.load(Ordering::Acquire);
-            let deadline = time::now_ms().wrapping_add(500);
-            while (rd32(SD_INFO1) & INFO1_ACCESS_END) == 0 {
-                if time::now_ms() >= deadline {
-                    return Err(SdError::Timeout);
-                }
-                core::hint::spin_loop();
-            }
             wr32(SD_INFO1, !INFO1_ACCESS_END);
             self.wait_not_busy()?;
             if err_code != 0 {
@@ -689,16 +720,8 @@ impl SdCard {
             }
         }
 
-        // Await IRQ 34 (DMAC0 CH3 completion) with a 2 s safety timeout.
-        let dma_wait = poll_fn(|cx| {
-            SD_DMA_WAKER.register(cx.waker());
-            if SD_DMA_DONE.load(Ordering::Acquire) {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        });
-        if matches!(select(dma_wait, Timer::after_millis(2000)).await, Either::Second(())) {
+        // Await IRQ 34 (DMAC0 CH3 completion) with a 2 s safety timeout + polling fallback.
+        if !self.wait_sd_dma_done(2000).await {
             unsafe {
                 self.stop_sd_dma();
                 wr32(SD_STOP, 0x0101);
@@ -707,27 +730,30 @@ impl SdCard {
             return Err(SdError::Timeout);
         }
 
+        let err_code = SD_DMA_ERR.load(Ordering::Acquire);
+        let deadline = time::now_ms().wrapping_add(1000);
+        loop {
+            let (i1, i2) = unsafe { (rd32(SD_INFO1), rd32(SD_INFO2)) };
+            if (i2 & INFO2_ERR_MASK) != 0 {
+                let err = (i2 & INFO2_ERR_MASK) as u16;
+                unsafe {
+                    self.stop_sd_dma();
+                    wr32(SD_INFO2, !INFO2_ERR_MASK);
+                }
+                return Err(SdError::CmdError(err));
+            }
+            if (i1 & INFO1_ACCESS_END) != 0 {
+                unsafe { wr32(SD_INFO1, !INFO1_ACCESS_END) };
+                break;
+            }
+            if time::now_ms() >= deadline {
+                unsafe { self.stop_sd_dma() };
+                return Err(SdError::Timeout);
+            }
+            embassy_futures::yield_now().await;
+        }
         unsafe {
             self.stop_sd_dma();
-            let err_code = SD_DMA_ERR.load(Ordering::Acquire);
-            let deadline = time::now_ms().wrapping_add(1000);
-            loop {
-                let i1 = rd32(SD_INFO1);
-                let i2 = rd32(SD_INFO2);
-                if (i2 & INFO2_ERR_MASK) != 0 {
-                    let err = (i2 & INFO2_ERR_MASK) as u16;
-                    wr32(SD_INFO2, !INFO2_ERR_MASK);
-                    return Err(SdError::CmdError(err));
-                }
-                if (i1 & INFO1_ACCESS_END) != 0 {
-                    wr32(SD_INFO1, !INFO1_ACCESS_END);
-                    break;
-                }
-                if time::now_ms() >= deadline {
-                    return Err(SdError::Timeout);
-                }
-                core::hint::spin_loop();
-            }
             self.wait_not_busy()?;
             if err_code != 0 {
                 return Err(SdError::CmdError(err_code as u16));

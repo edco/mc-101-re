@@ -9,14 +9,18 @@
 //! - Runtime SD ownership arbitration (`StorageMode::Firmware` vs `StorageMode::UsbMsc`)
 //!   over `embassy_sync::mutex::Mutex<NoopRawMutex, SdCard>`.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::future::poll_fn;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::task::Poll;
 
 use embassy_futures::join::join;
+use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
+use embassy_sync::waitqueue::AtomicWaker;
 use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestType};
 use embassy_usb::Handler;
-use embassy_usb_driver::{Endpoint, EndpointError, EndpointOut};
+use embassy_usb_driver::{Endpoint, EndpointError, EndpointIn, EndpointOut};
 
 use crate::hal::BlockDevice;
 use crate::sd::SdCard;
@@ -42,6 +46,8 @@ const SCSI_WRITE_10: u8 = 0x2A;
 const SCSI_VERIFY_10: u8 = 0x2F;
 const SCSI_SYNCHRONIZE_CACHE_10: u8 = 0x35;
 const SCSI_MODE_SENSE_10: u8 = 0x5A;
+const SCSI_READ_CAPACITY_16: u8 = 0x9E;
+const SCSI_REPORT_LUNS: u8 = 0xA0;
 
 // Standard 36-byte SCSI INQUIRY response
 const INQUIRY_DATA: [u8; 36] = [
@@ -112,7 +118,44 @@ pub type SharedSd = Mutex<NoopRawMutex, SdCard>;
 // -----------------------------------------------------------------------------
 
 static BOMSR_PENDING: AtomicBool = AtomicBool::new(false);
+static BOMSR_EPOCH: AtomicU32 = AtomicU32::new(0);
+static BOMSR_WAKER: AtomicWaker = AtomicWaker::new();
 static USB_CONFIGURED: AtomicBool = AtomicBool::new(false);
+static MEDIA_EJECTED: AtomicBool = AtomicBool::new(false);
+
+pub fn is_media_ejected() -> bool {
+    MEDIA_EJECTED.load(Ordering::Acquire)
+}
+
+async fn wait_bomsr_change(epoch: u32) {
+    poll_fn(|cx| {
+        BOMSR_WAKER.register(cx.waker());
+        if BOMSR_EPOCH.load(Ordering::Acquire) != epoch {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
+async fn send_in_data(
+    ep_in: &mut BmcEndpointIn,
+    expected_len: u32,
+    data: &[u8],
+) -> Result<u32, EndpointError> {
+    let n = (expected_len as usize).min(data.len());
+    if n > 0 {
+        ep_in.write_all(&data[..n]).await?;
+        // BOT Case 5 (Hi > Di): if we sent less than expected and ended on an exact
+        // wMaxPacketSize boundary, send a ZLP so the host terminates the data phase cleanly.
+        let mps = ep_in.negotiated_mps();
+        if n < (expected_len as usize) && mps > 0 && (n % mps) == 0 {
+            ep_in.write(&[]).await?;
+        }
+    }
+    Ok(expected_len.saturating_sub(n as u32))
+}
 
 pub fn is_usb_configured() -> bool {
     USB_CONFIGURED.load(Ordering::Acquire)
@@ -131,6 +174,7 @@ impl MscControlHandler {
 impl Handler for MscControlHandler {
     fn reset(&mut self) {
         USB_CONFIGURED.store(false, Ordering::Release);
+        MEDIA_EJECTED.store(false, Ordering::Release);
     }
 
     fn configured(&mut self, configured: bool) {
@@ -155,6 +199,8 @@ impl Handler for MscControlHandler {
             && req.length == 0
         {
             BOMSR_PENDING.store(true, Ordering::Release);
+            BOMSR_EPOCH.fetch_add(1, Ordering::AcqRel);
+            BOMSR_WAKER.wake();
             return Some(OutResponse::Accepted);
         }
         None
@@ -220,21 +266,46 @@ impl AsyncMsc {
             ep_out.wait_enabled().await;
             ep_in.wait_enabled().await;
 
-            // SAFETY: Single async MSC task owns CBW_RX_BUF exclusively.
-            let cbw = unsafe { &mut *(&raw mut CBW_RX_BUF.0) };
-            let n = match ep_out.read(cbw).await {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-
             if BOMSR_PENDING.swap(false, Ordering::AcqRel) {
+                crate::usb::flush_ep(ep_out.info().addr.index());
+                crate::usb::flush_ep(ep_in.info().addr.index());
                 self.clear_sense();
             }
 
-            if n < 31 {
+            let epoch = BOMSR_EPOCH.load(Ordering::Acquire);
+            // SAFETY: Single async MSC task owns CBW_RX_BUF exclusively.
+            let cbw = unsafe { &mut *(&raw mut CBW_RX_BUF.0) };
+            let n = match select(ep_out.read(cbw), wait_bomsr_change(epoch)).await {
+                Either::First(Ok(n)) => n,
+                Either::First(Err(_)) => continue,
+                Either::Second(()) => {
+                    BOMSR_PENDING.store(false, Ordering::Release);
+                    crate::usb::flush_ep(ep_out.info().addr.index());
+                    crate::usb::flush_ep(ep_in.info().addr.index());
+                    self.clear_sense();
+                    continue;
+                }
+            };
+
+            if BOMSR_PENDING.swap(false, Ordering::AcqRel) {
+                crate::usb::flush_ep(ep_out.info().addr.index());
+                crate::usb::flush_ep(ep_in.info().addr.index());
+                self.clear_sense();
+                continue;
+            }
+
+            if n != 31 {
                 ep_in.set_stalled(true);
                 ep_out.set_stalled(true);
-                ep_in.wait_unstalled().await;
+                match select(ep_in.wait_unstalled(), wait_bomsr_change(epoch)).await {
+                    Either::First(()) => {}
+                    Either::Second(()) => {
+                        BOMSR_PENDING.store(false, Ordering::Release);
+                        crate::usb::flush_ep(ep_out.info().addr.index());
+                        crate::usb::flush_ep(ep_in.info().addr.index());
+                        self.clear_sense();
+                    }
+                }
                 continue;
             }
 
@@ -242,7 +313,15 @@ impl AsyncMsc {
             if sig != CBW_SIG {
                 ep_in.set_stalled(true);
                 ep_out.set_stalled(true);
-                ep_in.wait_unstalled().await;
+                match select(ep_in.wait_unstalled(), wait_bomsr_change(epoch)).await {
+                    Either::First(()) => {}
+                    Either::Second(()) => {
+                        BOMSR_PENDING.store(false, Ordering::Release);
+                        crate::usb::flush_ep(ep_out.info().addr.index());
+                        crate::usb::flush_ep(ep_in.info().addr.index());
+                        self.clear_sense();
+                    }
+                }
                 continue;
             }
 
@@ -252,14 +331,35 @@ impl AsyncMsc {
             let mut cdb = [0u8; 16];
             cdb.copy_from_slice(&cbw[15..31]);
 
-            let (status, residue, stalled_in) = self
-                .handle_scsi(ep_out, ep_in, sd_mutex, &cdb, expected_len, flags)
-                .await;
+            let (status, residue, stalled_in) = match select(
+                self.handle_scsi(ep_out, ep_in, sd_mutex, &cdb, expected_len, flags),
+                wait_bomsr_change(epoch),
+            )
+            .await
+            {
+                Either::First(res) => res,
+                Either::Second(()) => {
+                    BOMSR_PENDING.store(false, Ordering::Release);
+                    crate::usb::flush_ep(ep_out.info().addr.index());
+                    crate::usb::flush_ep(ep_in.info().addr.index());
+                    self.clear_sense();
+                    continue;
+                }
+            };
 
             // BOT 13-Case Rule: if we stalled Bulk-IN during the data phase, we MUST wait
             // until the host sends CLEAR_FEATURE(ENDPOINT_HALT) before queuing the CSW!
             if stalled_in {
-                ep_in.wait_unstalled().await;
+                match select(ep_in.wait_unstalled(), wait_bomsr_change(epoch)).await {
+                    Either::First(()) => {}
+                    Either::Second(()) => {
+                        BOMSR_PENDING.store(false, Ordering::Release);
+                        crate::usb::flush_ep(ep_out.info().addr.index());
+                        crate::usb::flush_ep(ep_in.info().addr.index());
+                        self.clear_sense();
+                        continue;
+                    }
+                }
             }
 
             let mut csw = [0u8; 13];
@@ -267,7 +367,7 @@ impl AsyncMsc {
             csw[4..8].copy_from_slice(&tag.to_le_bytes());
             csw[8..12].copy_from_slice(&residue.to_le_bytes());
             csw[12] = status;
-            let _ = ep_in.write_all(&csw).await;
+            let _ = select(ep_in.write_all(&csw), wait_bomsr_change(epoch)).await;
         }
     }
 
@@ -285,8 +385,28 @@ impl AsyncMsc {
         // Commands that do not require active media access:
         match cdb[0] {
             SCSI_INQUIRY => {
-                // Reject EVPD=1 (Vital Product Data pages) cleanly with INVALID FIELD IN CDB.
                 if (cdb[1] & 0x01) != 0 {
+                    // EVPD=1: support VPD Page 0x00 (Supported VPD Pages) and 0x80 (Unit Serial Number)
+                    // so macOS IOUSBMassStorageDriver doesn't stall & reset during probe.
+                    let page = cdb[2];
+                    if page == 0x00 {
+                        let vpd00 = [0x00u8, 0x00, 0x00, 0x02, 0x00, 0x80];
+                        self.clear_sense();
+                        return match send_in_data(ep_in, expected_len, &vpd00).await {
+                            Ok(res) => (CSW_STATUS_PASSED, res, false),
+                            Err(_) => (CSW_STATUS_FAILED, expected_len, false),
+                        };
+                    } else if page == 0x80 {
+                        let vpd80 = [
+                            0x00u8, 0x80, 0x00, 12, b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0',
+                            b'0', b'0', b'0', b'1',
+                        ];
+                        self.clear_sense();
+                        return match send_in_data(ep_in, expected_len, &vpd80).await {
+                            Ok(res) => (CSW_STATUS_PASSED, res, false),
+                            Err(_) => (CSW_STATUS_FAILED, expected_len, false),
+                        };
+                    }
                     self.set_sense(0x05, 0x24, 0x00);
                     if expected_len > 0 && dir_in {
                         ep_in.set_stalled(true);
@@ -295,11 +415,21 @@ impl AsyncMsc {
                     return (CSW_STATUS_FAILED, expected_len, false);
                 }
                 self.clear_sense();
-                let n = (expected_len as usize).min(INQUIRY_DATA.len());
-                if ep_in.write_all(&INQUIRY_DATA[..n]).await.is_ok() {
-                    return (CSW_STATUS_PASSED, expected_len.saturating_sub(n as u32), false);
+                match send_in_data(ep_in, expected_len, &INQUIRY_DATA).await {
+                    Ok(res) => return (CSW_STATUS_PASSED, res, false),
+                    Err(_) => return (CSW_STATUS_FAILED, expected_len, false),
                 }
-                return (CSW_STATUS_FAILED, expected_len, false);
+            }
+
+            SCSI_REPORT_LUNS => {
+                // 1 LUN (LUN 0): list length = 8 bytes + 8-byte LUN entry.
+                let mut resp = [0u8; 16];
+                resp[3] = 8;
+                self.clear_sense();
+                return match send_in_data(ep_in, expected_len, &resp).await {
+                    Ok(res) => (CSW_STATUS_PASSED, res, false),
+                    Err(_) => (CSW_STATUS_FAILED, expected_len, false),
+                };
             }
 
             SCSI_REQUEST_SENSE => {
@@ -310,18 +440,19 @@ impl AsyncMsc {
                 resp[12] = self.asc;
                 resp[13] = self.ascq;
                 self.clear_sense();
-                let n = (expected_len as usize).min(resp.len());
-                if ep_in.write_all(&resp[..n]).await.is_ok() {
-                    return (CSW_STATUS_PASSED, expected_len.saturating_sub(n as u32), false);
-                }
-                return (CSW_STATUS_FAILED, expected_len, false);
+                return match send_in_data(ep_in, expected_len, &resp).await {
+                    Ok(res) => (CSW_STATUS_PASSED, res, false),
+                    Err(_) => (CSW_STATUS_FAILED, expected_len, false),
+                };
             }
 
             _ => {}
         }
 
-        // Runtime arbitration gate: only touch SD when StorageMode::UsbMsc is active.
-        if storage_mode() != StorageMode::UsbMsc {
+        // Runtime arbitration gate: only touch SD when StorageMode::UsbMsc is active and not ejected.
+        if storage_mode() != StorageMode::UsbMsc
+            || (MEDIA_EJECTED.load(Ordering::Acquire) && cdb[0] != SCSI_START_STOP_UNIT)
+        {
             self.set_sense(0x02, 0x3A, 0x00); // NOT READY - MEDIUM NOT PRESENT
             if expected_len > 0 && dir_in {
                 ep_in.set_stalled(true);
@@ -357,11 +488,38 @@ impl AsyncMsc {
                 resp[0..4].copy_from_slice(&last_lba.to_be_bytes());
                 resp[4..8].copy_from_slice(&512u32.to_be_bytes());
                 self.clear_sense();
-                let n = (expected_len as usize).min(resp.len());
-                if ep_in.write_all(&resp[..n]).await.is_ok() {
-                    (CSW_STATUS_PASSED, expected_len.saturating_sub(n as u32), false)
-                } else {
-                    (CSW_STATUS_FAILED, expected_len, false)
+                match send_in_data(ep_in, expected_len, &resp).await {
+                    Ok(res) => (CSW_STATUS_PASSED, res, false),
+                    Err(_) => (CSW_STATUS_FAILED, expected_len, false),
+                }
+            }
+
+            SCSI_READ_CAPACITY_16 => {
+                if (cdb[1] & 0x1F) != 0x10 {
+                    self.set_sense(0x05, 0x24, 0x00);
+                    if expected_len > 0 && dir_in {
+                        ep_in.set_stalled(true);
+                        return (CSW_STATUS_FAILED, expected_len, true);
+                    }
+                    return (CSW_STATUS_FAILED, expected_len, false);
+                }
+                let blocks = sd.block_count();
+                if blocks == 0 {
+                    self.set_sense(0x02, 0x3A, 0x00);
+                    if expected_len > 0 && dir_in {
+                        ep_in.set_stalled(true);
+                        return (CSW_STATUS_FAILED, expected_len, true);
+                    }
+                    return (CSW_STATUS_FAILED, expected_len, false);
+                }
+                let last_lba = blocks - 1;
+                let mut resp = [0u8; 32];
+                resp[0..8].copy_from_slice(&last_lba.to_be_bytes());
+                resp[8..12].copy_from_slice(&512u32.to_be_bytes());
+                self.clear_sense();
+                match send_in_data(ep_in, expected_len, &resp).await {
+                    Ok(res) => (CSW_STATUS_PASSED, res, false),
+                    Err(_) => (CSW_STATUS_FAILED, expected_len, false),
                 }
             }
 
@@ -373,11 +531,9 @@ impl AsyncMsc {
                 resp[8] = 0x02;
                 resp[10] = 0x02; // 512 bytes/block
                 self.clear_sense();
-                let n = (expected_len as usize).min(resp.len());
-                if ep_in.write_all(&resp[..n]).await.is_ok() {
-                    (CSW_STATUS_PASSED, expected_len.saturating_sub(n as u32), false)
-                } else {
-                    (CSW_STATUS_FAILED, expected_len, false)
+                match send_in_data(ep_in, expected_len, &resp).await {
+                    Ok(res) => (CSW_STATUS_PASSED, res, false),
+                    Err(_) => (CSW_STATUS_FAILED, expected_len, false),
                 }
             }
 
@@ -385,11 +541,9 @@ impl AsyncMsc {
                 let wp = if self.read_only { 0x80 } else { 0x00 };
                 let resp = [3u8, 0x00, wp, 0x00];
                 self.clear_sense();
-                let n = (expected_len as usize).min(resp.len());
-                if ep_in.write_all(&resp[..n]).await.is_ok() {
-                    (CSW_STATUS_PASSED, expected_len.saturating_sub(n as u32), false)
-                } else {
-                    (CSW_STATUS_FAILED, expected_len, false)
+                match send_in_data(ep_in, expected_len, &resp).await {
+                    Ok(res) => (CSW_STATUS_PASSED, res, false),
+                    Err(_) => (CSW_STATUS_FAILED, expected_len, false),
                 }
             }
 
@@ -397,11 +551,9 @@ impl AsyncMsc {
                 let wp = if self.read_only { 0x80 } else { 0x00 };
                 let resp = [0x00, 0x06, 0x00, wp, 0x00, 0x00, 0x00, 0x00];
                 self.clear_sense();
-                let n = (expected_len as usize).min(resp.len());
-                if ep_in.write_all(&resp[..n]).await.is_ok() {
-                    (CSW_STATUS_PASSED, expected_len.saturating_sub(n as u32), false)
-                } else {
-                    (CSW_STATUS_FAILED, expected_len, false)
+                match send_in_data(ep_in, expected_len, &resp).await {
+                    Ok(res) => (CSW_STATUS_PASSED, res, false),
+                    Err(_) => (CSW_STATUS_FAILED, expected_len, false),
                 }
             }
 
@@ -577,9 +729,10 @@ impl AsyncMsc {
 
             SCSI_START_STOP_UNIT => {
                 let _ = sd.flush();
-                // LoEj=1 (bit 1), Start=0 (bit 0) -> Host ejected the volume; hand SD back to firmware.
                 if (cdb[4] & 0x03) == 0x02 {
-                    set_storage_mode(StorageMode::Firmware);
+                    MEDIA_EJECTED.store(true, Ordering::Release);
+                } else if (cdb[4] & 0x01) == 0x01 {
+                    MEDIA_EJECTED.store(false, Ordering::Release);
                 }
                 self.clear_sense();
                 (CSW_STATUS_PASSED, 0, false)

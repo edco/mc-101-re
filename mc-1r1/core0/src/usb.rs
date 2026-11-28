@@ -97,8 +97,10 @@ const EV_RESUME: u32 = 1 << 2;
 
 static HIGH_SPEED: AtomicBool = AtomicBool::new(true);
 static CONFIGURED: AtomicBool = AtomicBool::new(false);
+static USB_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static EP_ENABLED_MASK: AtomicU32 = AtomicU32::new(0);
 static EP_ALLOC_MASK: AtomicU32 = AtomicU32::new(0);
+static RESET_EPOCH: AtomicU32 = AtomicU32::new(0);
 
 // Allocated endpoint metadata (for re-programming 0x4006_2200+ on INT_ENUM_DONE)
 static EP_DIR_IN_MASK: AtomicU32 = AtomicU32::new(0);
@@ -364,9 +366,11 @@ pub unsafe extern "C" fn USB_IRQ_Handler() {
             core::hint::spin_loop();
         }
         CONFIGURED.store(false, Ordering::Release);
+        USB_SUSPENDED.store(false, Ordering::Release);
         EP_ENABLED_MASK.store(0, Ordering::Release);
         SETUP_READY.store(false, Ordering::Release);
         SYNTH_SET_CONFIG.store(false, Ordering::Release);
+        RESET_EPOCH.fetch_add(1, Ordering::AcqRel);
         BUS_EVENTS.fetch_or(EV_RESET, Ordering::Release);
         BUS_WAKER.wake();
         EP0_WAKER.wake();
@@ -385,7 +389,14 @@ pub unsafe extern "C" fn USB_IRQ_Handler() {
     }
 
     if (pending & INT_SETUP) != 0 {
+        USB_SUSPENDED.store(false, Ordering::Release);
         wr32(USB_INT_STAT, !INT_SETUP);
+        // Clear any leftover EP0 STALL from a previous rejected SETUP request
+        // (e.g. GET_DESCRIPTOR(DEVICE_QUALIFIER) or BOS on macOS).
+        let ep0_ctrl = rd32(USB_EP0_CTRL);
+        if (ep0_ctrl & 4) != 0 {
+            wr32(USB_EP0_CTRL, ep0_ctrl & !4);
+        }
         for _ in 0..50_000u32 {
             if (rd32(USB_EP0_STAT) & 0x20000) != 0 {
                 break;
@@ -404,6 +415,7 @@ pub unsafe extern "C" fn USB_IRQ_Handler() {
 
     if (pending & INT_SET_CONFIG) != 0 {
         wr32(USB_INT_STAT, !INT_SET_CONFIG);
+        USB_SUSPENDED.store(false, Ordering::Release);
         CONFIGURED.store(true, Ordering::Release);
         SYNTH_SET_CONFIG.store(true, Ordering::Release);
         EP0_WAKER.wake();
@@ -414,9 +426,11 @@ pub unsafe extern "C" fn USB_IRQ_Handler() {
     // ControlPipe::setup() (EP0), which causes Linux usb-storage GET_MAX_LUN to time out for 10s!
     if (pending & INT_SUSPEND) != 0 {
         wr32(USB_INT_STAT, !INT_SUSPEND);
+        USB_SUSPENDED.store(true, Ordering::Release);
     }
     if (pending & INT_RESUME) != 0 {
         wr32(USB_INT_STAT, !INT_RESUME);
+        USB_SUSPENDED.store(false, Ordering::Release);
     }
     if (pending & INT_SET_IFACE) != 0 {
         wr32(USB_INT_STAT, !INT_SET_IFACE);
@@ -441,14 +455,18 @@ pub unsafe extern "C" fn USB_IRQ_Handler() {
         }
     }
 
-    // Safety breaker: if IRQ 20 fires >= 2048 times consecutively without any endpoint/setup
-    // consumer clearing EMPTY_IRQ_STREAK, mask all sources and disable IRQ 20 so Core 0 never freezes.
+    // Clear any unhandled EP/misc IRQ sources without permanently disabling NVIC IRQ 20,
+    // so USB can still receive INT_BUS_RESET / INT_SETUP and recover cleanly.
     static EMPTY_IRQ_STREAK: AtomicU32 = AtomicU32::new(0);
     if pending == 0 && ep_pending == 0 && misc_stat == 0 {
         if EMPTY_IRQ_STREAK.fetch_add(1, Ordering::Relaxed) >= 64 {
+            let misc_all = rd32(USB_EP_MISC_STAT);
+            if misc_all != 0 {
+                wr32(USB_EP_MISC_STAT, !misc_all);
+            }
             wr32(USB_EP_INT_MASK, 0xFFFF_FFFF);
             wr32(USB_EP_MISC_MASK, rd32(USB_EP_MISC_MASK) | 0x7F);
-            nvic_disable_irq(USB_IRQ_NUM);
+            EMPTY_IRQ_STREAK.store(0, Ordering::Relaxed);
         }
     } else {
         EMPTY_IRQ_STREAK.store(0, Ordering::Relaxed);
@@ -460,13 +478,18 @@ pub fn is_high_speed() -> bool {
     HIGH_SPEED.load(Ordering::Acquire)
 }
 
+/// Query whether the USB bus is currently suspended / unplugged.
+pub fn is_suspended() -> bool {
+    USB_SUSPENDED.load(Ordering::Acquire)
+}
+
 /// Set or clear hardware STALL on any endpoint `ep_idx` (`USB_EPn_CTRL` bit 1).
 pub fn ep_set_stalled(ep_idx: usize, stalled: bool) {
     if ep_idx == 0 || ep_idx >= 15 {
         return;
     }
-    // SAFETY: Atomic RMW on dedicated endpoint control register.
-    unsafe {
+    // SAFETY: Critical-section protected RMW on dedicated endpoint control register.
+    critical_section::with(|_| unsafe {
         let ctrl = ep_ctrl_addr(ep_idx);
         if stalled {
             wr32(ctrl, rd32(ctrl) | 2);
@@ -474,7 +497,29 @@ pub fn ep_set_stalled(ep_idx: usize, stalled: bool) {
             wr32(ctrl, rd32(ctrl) & !2);
         }
         dsb();
+    });
+}
+
+/// Flush endpoint FIFO, clear STALL, and reset endpoint IRQ state (used on `BOMSR`).
+pub fn flush_ep(ep_idx: usize) {
+    if ep_idx == 0 || ep_idx >= 15 {
+        return;
     }
+    critical_section::with(|_| unsafe {
+        let ctrl = ep_ctrl_addr(ep_idx);
+        wr32(ctrl, rd32(ctrl) | 0x8000);
+        for _ in 0..10_000u32 {
+            if (rd32(ctrl) & 0x8000) == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let v = (rd32(ctrl) & 0xFF00_F00F) | EP_IRQ_MASK_ALL;
+        wr32(ctrl, v);
+        wr32(USB_EP_INT_MASK, rd32(USB_EP_INT_MASK) | (1u32 << ep_idx));
+        dsb();
+    });
+    EP_WAKERS[ep_idx].wake();
 }
 
 /// Query hardware STALL bit (`USB_EPn_CTRL` bit 1) on any endpoint `ep_idx`.
@@ -625,6 +670,7 @@ impl Bus for BmcBus {
         self.enabled = true;
         BUS_EVENTS.store(0, Ordering::Release);
         CONFIGURED.store(false, Ordering::Release);
+        USB_SUSPENDED.store(false, Ordering::Release);
         EP_ENABLED_MASK.store(0, Ordering::Release);
         SETUP_READY.store(false, Ordering::Release);
         SYNTH_SET_CONFIG.store(false, Ordering::Release);
@@ -672,6 +718,7 @@ impl Bus for BmcBus {
     async fn disable(&mut self) {
         self.enabled = false;
         CONFIGURED.store(false, Ordering::Release);
+        USB_SUSPENDED.store(false, Ordering::Release);
         EP_ENABLED_MASK.store(0, Ordering::Release);
         force_disconnect();
     }
@@ -740,41 +787,54 @@ pub struct BmcControlPipe {
 }
 
 impl BmcControlPipe {
-    unsafe fn send_ep0_in_raw(&self, data: &[u8], last: bool) {
+    async fn wait_ep0_stat_bit(&self, bit_mask: u32, epoch: u32) -> bool {
+        let deadline = crate::time::now_ms().wrapping_add(100);
+        loop {
+            if RESET_EPOCH.load(Ordering::Acquire) != epoch || SETUP_READY.load(Ordering::Acquire) {
+                return false;
+            }
+            // SAFETY: Volatile read of EP0 status register.
+            if unsafe { (rd32(USB_EP0_STAT) & bit_mask) != 0 } {
+                return true;
+            }
+            if crate::time::now_ms() >= deadline {
+                return false;
+            }
+            embassy_futures::yield_now().await;
+        }
+    }
+
+    async fn send_ep0_in_raw(&self, data: &[u8], last: bool) -> Result<(), EndpointError> {
+        let epoch = RESET_EPOCH.load(Ordering::Acquire);
         let mut offset = 0;
         let len = data.len();
         loop {
             let chunk = (len - offset).min(64);
-            for _ in 0..500_000u32 {
-                if (rd32(USB_EP0_STAT) & 0x08) != 0 {
-                    break;
-                }
-                core::hint::spin_loop();
+            if !self.wait_ep0_stat_bit(0x08, epoch).await {
+                return Err(EndpointError::Disabled);
             }
             if chunk > 0 {
-                dma_write_fifo(USB_EP0_IN_FIFO, &data[offset..offset + chunk]);
+                // SAFETY: EP0 IN FIFO is ready and owned by ControlPipe.
+                unsafe { dma_write_fifo(USB_EP0_IN_FIFO, &data[offset..offset + chunk]) };
             }
-            for _ in 0..500_000u32 {
-                if (rd32(USB_EP0_STAT) & 0x08) != 0 {
-                    break;
-                }
-                core::hint::spin_loop();
+            if !self.wait_ep0_stat_bit(0x08, epoch).await {
+                return Err(EndpointError::Disabled);
             }
-            wr32(USB_EP0_STAT, 0x00E7_0008);
+            // SAFETY: Commit EP0 IN packet.
+            unsafe { wr32(USB_EP0_STAT, 0x00E7_0008) };
             offset += chunk;
             if offset >= len {
                 break;
             }
         }
         if last && len > 0 {
-            for _ in 0..500_000u32 {
-                if (rd32(USB_EP0_STAT) & 0x10) != 0 {
-                    break;
-                }
-                core::hint::spin_loop();
+            if !self.wait_ep0_stat_bit(0x10, epoch).await {
+                return Err(EndpointError::Disabled);
             }
-            wr32(USB_EP0_STAT, 0x00E7_0010);
+            // SAFETY: Acknowledge EP0 status OUT stage.
+            unsafe { wr32(USB_EP0_STAT, 0x00E7_0010) };
         }
+        Ok(())
     }
 }
 
@@ -811,11 +871,36 @@ impl ControlPipe for BmcControlPipe {
 
     async fn data_out(
         &mut self,
-        _buf: &mut [u8],
+        buf: &mut [u8],
         _first: bool,
         _last: bool,
     ) -> Result<usize, EndpointError> {
-        Ok(0)
+        let epoch = RESET_EPOCH.load(Ordering::Acquire);
+        if !self.wait_ep0_stat_bit(0x0001_0000, epoch).await {
+            return Err(EndpointError::Disabled);
+        }
+        // SAFETY: EP0 OUT FIFO holds host control-OUT payload.
+        unsafe {
+            wr32(USB_EP0_STAT, 0x00FA_6000);
+            let pkt_len = (rd32(ep_out_len_addr(0)) & 0x7FF) as usize;
+            if pkt_len > buf.len() {
+                let mut sink = [0u8; 64];
+                let mut rem = pkt_len;
+                while rem > 0 {
+                    let n = rem.min(sink.len());
+                    dma_read_fifo(USB_EP0_OUT_FIFO, &mut sink[..n]);
+                    rem -= n;
+                }
+                wr32(USB_EP0_STAT, 0x00FB_6008);
+                return Err(EndpointError::BufferOverflow);
+            }
+            if pkt_len > 0 {
+                dma_read_fifo(USB_EP0_OUT_FIFO, &mut buf[..pkt_len]);
+            }
+            wr32(USB_EP0_STAT, 0x00FB_6008);
+            dsb();
+            Ok(pkt_len)
+        }
     }
 
     async fn data_in(
@@ -852,11 +937,10 @@ impl ControlPipe for BmcControlPipe {
                 }
                 pos += dlen;
             }
-            unsafe { self.send_ep0_in_raw(&patched[..n], last) };
+            self.send_ep0_in_raw(&patched[..n], last).await
         } else {
-            unsafe { self.send_ep0_in_raw(data, last) };
+            self.send_ep0_in_raw(data, last).await
         }
-        Ok(())
     }
 
     async fn accept(&mut self) {
@@ -865,7 +949,7 @@ impl ControlPipe for BmcControlPipe {
             return;
         }
         // ZLP IN status stage for 0-length host-to-device control requests (e.g. BOMSR).
-        unsafe { self.send_ep0_in_raw(&[], true) };
+        let _ = self.send_ep0_in_raw(&[], true).await;
     }
 
     async fn reject(&mut self) {
@@ -943,14 +1027,18 @@ impl EndpointOut for BmcEndpointOut {
                 let st = rd32(stat);
                 if (st & 0x0001_0000) == 0 {
                     // Unmask ONLY OUT packet ready (bit 16) + this EP in USB_EP_INT_MASK.
-                    wr32(ctrl, (rd32(ctrl) | EP_IRQ_MASK_ALL) & !0x0001_0000);
-                    wr32(USB_EP_INT_MASK, rd32(USB_EP_INT_MASK) & !(1u32 << ep));
+                    critical_section::with(|_| {
+                        wr32(ctrl, (rd32(ctrl) | EP_IRQ_MASK_ALL) & !0x0001_0000);
+                        wr32(USB_EP_INT_MASK, rd32(USB_EP_INT_MASK) & !(1u32 << ep));
+                    });
                     return Poll::Pending;
                 }
                 wr32(stat, 0x00FA_6000);
                 if (rd32(stat) & 0x08) == 0 {
-                    wr32(ctrl, (rd32(ctrl) | EP_IRQ_MASK_ALL) & !0x0001_0000);
-                    wr32(USB_EP_INT_MASK, rd32(USB_EP_INT_MASK) & !(1u32 << ep));
+                    critical_section::with(|_| {
+                        wr32(ctrl, (rd32(ctrl) | EP_IRQ_MASK_ALL) & !0x0001_0000);
+                        wr32(USB_EP_INT_MASK, rd32(USB_EP_INT_MASK) & !(1u32 << ep));
+                    });
                     return Poll::Pending;
                 }
                 let pkt_len = (rd32(len_reg) & 0x7FF) as usize;
@@ -1053,17 +1141,22 @@ impl EndpointIn for BmcEndpointIn {
                     // (0x04) to avoid a race, and unmask bit 16 + this EP in USB_EP_INT_MASK.
                     wr32(stat, 0x00FA_6000);
                     if (rd32(stat) & 0x04) == 0 {
-                        wr32(ctrl, (rd32(ctrl) | EP_IRQ_MASK_ALL) & !0x0001_0000);
-                        wr32(USB_EP_INT_MASK, rd32(USB_EP_INT_MASK) & !(1u32 << ep));
+                        critical_section::with(|_| {
+                            wr32(ctrl, (rd32(ctrl) | EP_IRQ_MASK_ALL) & !0x0001_0000);
+                            wr32(USB_EP_INT_MASK, rd32(USB_EP_INT_MASK) & !(1u32 << ep));
+                        });
                         return Poll::Pending;
                     }
                 }
                 if !buf.is_empty() {
                     dma_write_fifo(fifo, buf);
                 }
-                for _ in 0..500_000u32 {
+                for _ in 0..50_000u32 {
                     if (rd32(stat) & 0x04) != 0 {
                         break;
+                    }
+                    if (EP_ENABLED_MASK.load(Ordering::Acquire) & (1 << ep)) == 0 {
+                        return Poll::Ready(Err(EndpointError::Disabled));
                     }
                     core::hint::spin_loop();
                 }
