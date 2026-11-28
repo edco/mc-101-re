@@ -74,8 +74,10 @@ embassy_time_driver::time_driver_impl!(static DRIVER: SysTickDriver = SysTickDri
 pub fn init(sysclk_hz: u32) {
     let reload = (sysclk_hz / 1_000).saturating_sub(1).clamp(1, 0x00FF_FFFF);
 
-    // SAFETY: Standard Cortex-M4 SysTick registers; called once during Core 0 boot.
+    // SAFETY: Standard Cortex-M4 SysTick + SHPR3 registers; called once during Core 0 boot.
     unsafe {
+        let shpr3 = core::ptr::read_volatile(0xE000_ED20 as *const u32);
+        core::ptr::write_volatile(0xE000_ED20 as *mut u32, shpr3 & 0x00FF_FFFF);
         core::ptr::write_volatile(SYST_CSR as *mut u32, 0);
         core::ptr::write_volatile(SYST_RVR as *mut u32, reload);
         core::ptr::write_volatile(SYST_CVR as *mut u32, 0);

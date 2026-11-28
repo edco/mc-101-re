@@ -64,14 +64,14 @@ const DMAC_CFG0_BASE: u32 = 0xA080_0000;
 const DMAC_CFG1_WR_FIFO: u32 = 0x0900_0000;
 const DMAC_CFG1_RD_FIFO: u32 = 0x0A00_0000;
 
-// USB_INT_STAT (+0x008) interrupt bits (Write-0-to-Clear, App0_UPD 0x6001_F5FC..0x6001_F6B6)
+// USB_INT_STAT (+0x008) interrupt bits (Write-0-to-Clear, verified from BootROM 0x3544..0x3740 & App0_UPD 0x6001_F5FC..0x6001_F6B6)
 const INT_VBUS_BIT31: u32 = 1 << 31;
-const INT_SUSPEND: u32 = 1 << 30;
+const INT_SET_CONFIG: u32 = 1 << 30;
 const INT_BUS_RESET: u32 = 1 << 29;
 const INT_ENUM_DONE: u32 = 1 << 28;
 const INT_SETUP: u32 = 1 << 27;
-const INT_SET_CONFIG: u32 = 1 << 26;
-const INT_SET_IFACE: u32 = 1 << 25;
+const INT_SOF: u32 = 1 << 26; // Start-of-Frame (8 kHz on HS; masked by 0x84FF_BFFF)
+const INT_SUSPEND: u32 = 1 << 25;
 const INT_RESUME: u32 = 1 << 24;
 
 // Endpoint interrupt mask bits in USB_EPn_CTRL (bits [23:16]: 1 = masked).
@@ -413,6 +413,11 @@ pub unsafe extern "C" fn USB_IRQ_Handler() {
         EP0_WAKER.wake();
     }
 
+    if (pending & INT_SOF) != 0 {
+        wr32(USB_CFG, rd32(USB_CFG) | INT_SOF);
+        wr32(USB_INT_STAT, !INT_SOF);
+    }
+
     if (pending & INT_SET_CONFIG) != 0 {
         wr32(USB_INT_STAT, !INT_SET_CONFIG);
         USB_SUSPENDED.store(false, Ordering::Release);
@@ -421,7 +426,7 @@ pub unsafe extern "C" fn USB_IRQ_Handler() {
         EP0_WAKER.wake();
     }
 
-    // Clear SUSPEND / RESUME / SET_IFACE in hardware (W0C). Do NOT emit Event::Suspend to
+    // Clear SUSPEND / RESUME in hardware (W0C). Do NOT emit Event::Suspend to
     // embassy-usb: embassy-usb exits run_until_suspend() on Event::Suspend and stops polling
     // ControlPipe::setup() (EP0), which causes Linux usb-storage GET_MAX_LUN to time out for 10s!
     if (pending & INT_SUSPEND) != 0 {
@@ -431,9 +436,6 @@ pub unsafe extern "C" fn USB_IRQ_Handler() {
     if (pending & INT_RESUME) != 0 {
         wr32(USB_INT_STAT, !INT_RESUME);
         USB_SUSPENDED.store(false, Ordering::Release);
-    }
-    if (pending & INT_SET_IFACE) != 0 {
-        wr32(USB_INT_STAT, !INT_SET_IFACE);
     }
 
     // Clear any pending misc/stall/clear-halt status bits in 0x4006_217C (W0C: App0_UPD 0x6001_F6D2).
@@ -694,7 +696,8 @@ impl Bus for BmcBus {
 
         unsafe {
             wr32(USB_CFG, rd32(USB_CFG) | 0x0080_0000);
-            wr32(USB_CFG, rd32(USB_CFG) & 0x80FF_BFFF);
+            // Match BootROM (0x3804) & App0_UPD (0x6001_F828): mask bit 31 (VBUS) & bit 26 (SOF).
+            wr32(USB_CFG, (rd32(USB_CFG) | 0x8400_0000) & 0x84FF_BFFF);
             wr32(USB_CTRL, (rd32(USB_CTRL) & !3) | 2);
             wr32(USB_INT_STAT, 0); // Clear all latched W0C global IRQ flags (App0_UPD 0x6001_F4EE)
             dsb();

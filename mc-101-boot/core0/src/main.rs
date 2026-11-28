@@ -123,6 +123,9 @@ Reset_Handler:
     str r1, [r0]
     dsb
     isb
+    ldr r0, ={init_msp}
+    msr msp, r0
+    isb
     ldr r0, ={main_fn}
     bx r0
     .ltorg
@@ -130,6 +133,7 @@ Reset_Handler:
     saved_lr = sym SAVED_LR,
     vtor = const SCB_VTOR,
     itcm_base = const CORE0_ITCM_BASE,
+    init_msp = const CORE0_INITIAL_MSP,
     main_fn = sym bootloader_main,
 );
 
@@ -146,6 +150,8 @@ pub struct AlignedVectorTable([Vector; 128]);
 const fn build_vector_table() -> AlignedVectorTable {
     extern "C" {
         fn Reset_Handler();
+        fn HardFault_Handler();
+        fn SysTick_Handler();
     }
     let mut t = [Vector {
         handler: Default_Handler,
@@ -160,7 +166,7 @@ const fn build_vector_table() -> AlignedVectorTable {
         handler: HardFault_Handler,
     };
     t[15] = Vector {
-        handler: time::SysTick_Handler,
+        handler: SysTick_Handler,
     };
     t[16 + usb::USB_IRQ_NUM] = Vector {
         handler: usb::USB_IRQ_Handler,
@@ -742,7 +748,9 @@ async fn usb_msc_task(usb: UsbDevice, sd: SdCard, mb: u32) {
     let monitor = async {
         let mut was_configured = false;
         let mut was_ejected = false;
+        time::wdt_arm();
         loop {
+            time::wdt_feed();
             if SHUTDOWN_REQ.load(Ordering::Acquire) {
                 break;
             }
@@ -875,23 +883,87 @@ fn enter_usb_storage_mode(mut p: Peripherals) -> ! {
     });
 }
 
+fn fmt_hex32(val: u32, dst: &mut [u8]) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for i in 0..8 {
+        dst[i] = HEX[((val >> (28 - i * 4)) & 0xF) as usize];
+    }
+}
+
+unsafe fn fault_banner(row0: &[u8; 16], row1: &[u8; 16]) -> ! {
+    usb::force_disconnect();
+    let mut lcd = LcdCh7::new();
+    lcd.write_line(0, row0);
+    lcd.write_line(1, row1);
+    lcd.flush();
+    let mut pwr = PowerCtl::new();
+    loop {
+        if pwr.poll_tick() {
+            pwr.safe_shutdown(&mut lcd, || {});
+        }
+        for _ in 0..100_000u32 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    loop {
-        core::hint::spin_loop();
-    }
+    unsafe { fault_banner(b"FAULT: PANIC    ", b"                ") }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn Default_Handler() {
-    loop {
-        core::hint::spin_loop();
-    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let ipsr: u32;
+    asm!("mrs {}, ipsr", out(reg) ipsr, options(nomem, nostack, preserves_flags));
+    let mut r0 = *b"FAULT: IRQ 0x00 ";
+    r0[13] = HEX[((ipsr >> 4) & 0xF) as usize];
+    r0[14] = HEX[(ipsr & 0xF) as usize];
+    let mut r1 = *b"CFSR: 00000000  ";
+    let cfsr = core::ptr::read_volatile(0xE000_ED28 as *const u32);
+    fmt_hex32(cfsr, &mut r1[6..14]);
+    fault_banner(&r0, &r1);
+}
+
+pub unsafe fn wdt_report(pc: u32, lr: u32) -> ! {
+    let usb_st = core::ptr::read_volatile(0x4006_2008 as *const u32);
+    let mut r0 = *b"WDT PC=00000000 ";
+    let mut r1 = *b"L00000000 U0000 ";
+    fmt_hex32(pc, &mut r0[7..15]);
+    fmt_hex32(lr, &mut r1[1..9]);
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    r1[11] = HEX[((usb_st >> 28) & 0xF) as usize];
+    r1[12] = HEX[((usb_st >> 24) & 0xF) as usize];
+    r1[13] = HEX[((usb_st >> 20) & 0xF) as usize];
+    r1[14] = HEX[((usb_st >> 16) & 0xF) as usize];
+    fault_banner(&r0, &r1);
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn HardFault_Handler() {
-    loop {
-        core::hint::spin_loop();
-    }
+pub unsafe extern "C" fn hardfault_report(frame: *const u32) -> ! {
+    let pc = core::ptr::read_volatile(frame.add(6));
+    let cfsr = core::ptr::read_volatile(0xE000_ED28 as *const u32);
+    let mut r0 = *b"HF PC=00000000  ";
+    let mut r1 = *b"CFSR=00000000   ";
+    fmt_hex32(pc, &mut r0[6..14]);
+    fmt_hex32(cfsr, &mut r1[5..13]);
+    fault_banner(&r0, &r1);
 }
+
+global_asm!(
+    r#"
+    .syntax unified
+    .thumb
+    .section .itcm,"ax",%progbits
+    .align 2
+    .global HardFault_Handler
+    .thumb_func
+HardFault_Handler:
+    tst lr, #4
+    ite eq
+    mrseq r0, msp
+    mrsne r0, psp
+    b hardfault_report
+    "#
+);

@@ -75,9 +75,9 @@ struct PingPongBufs {
     b: [u8; CHUNK_BYTES],
 }
 
-/// Place the 128 KiB USB MSC ping-pong buffers in SDRAM (`0x6100_0000`) when Storage Mode
-/// is active so `SRAM0` (128 KiB) stays free for normal boot (`PATCH_BUF = 64 KiB`).
-const PING_PONG_SDRAM_ADDR: usize = 0x6100_0000;
+/// Place the 128 KiB USB MSC ping-pong buffers in Core 0 SDRAM (`0x6010_0000`) when Storage Mode
+/// is active (matching `mc-1r1` placement; Storage Mode never boots `App1_Main`).
+const PING_PONG_SDRAM_ADDR: usize = 0x6010_0000;
 
 #[repr(C, align(4))]
 struct CbwBuf([u8; 512]);
@@ -565,7 +565,7 @@ impl AsyncMsc {
                     return (CSW_STATUS_PASSED, expected_len, false);
                 }
 
-                // SAFETY: Storage Mode owns SDRAM 0x6100_0000+ exclusively.
+                // SAFETY: Storage Mode owns Core 0 SDRAM 0x6010_0000+ exclusively.
                 let (buf_a, buf_b) = unsafe {
                     let pp = &mut *(PING_PONG_SDRAM_ADDR as *mut PingPongBufs);
                     (&mut pp.a, &mut pp.b)

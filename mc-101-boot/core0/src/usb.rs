@@ -64,14 +64,14 @@ const DMAC_CFG0_BASE: u32 = 0xA080_0000;
 const DMAC_CFG1_WR_FIFO: u32 = 0x0900_0000;
 const DMAC_CFG1_RD_FIFO: u32 = 0x0A00_0000;
 
-// USB_INT_STAT (+0x008) interrupt bits (Write-0-to-Clear, App0_UPD 0x6001_F5FC..0x6001_F6B6)
+// USB_INT_STAT (+0x008) interrupt bits (Write-0-to-Clear, verified from BootROM 0x3544..0x3740 & App0_UPD 0x6001_F5FC..0x6001_F6B6)
 const INT_VBUS_BIT31: u32 = 1 << 31;
-const INT_SUSPEND: u32 = 1 << 30;
+const INT_SET_CONFIG: u32 = 1 << 30;
 const INT_BUS_RESET: u32 = 1 << 29;
 const INT_ENUM_DONE: u32 = 1 << 28;
 const INT_SETUP: u32 = 1 << 27;
-const INT_SET_CONFIG: u32 = 1 << 26;
-const INT_SET_IFACE: u32 = 1 << 25;
+const INT_SOF: u32 = 1 << 26; // Start-of-Frame (8 kHz on HS; masked by 0x84FF_BFFF)
+const INT_SUSPEND: u32 = 1 << 25;
 const INT_RESUME: u32 = 1 << 24;
 
 // Endpoint interrupt mask bits in USB_EPn_CTRL (bits [23:16]: 1 = masked).
@@ -80,10 +80,9 @@ const EP_IRQ_MASK_ALL: u32 = 0x00FF_0000;
 // Hardware endpoint config RAM slot table (from Boot ROM `0x0120_3E60`)
 const HW_EP_SLOT: [u8; 15] = [1, 0, 0, 2, 4, 5, 7, 8, 9, 10, 0, 0, 11, 12, 22];
 
-/// 4-byte-aligned SDRAM bounce buffer for stack/ITCM or unaligned DMA slices.
-#[repr(C, align(4))]
-struct DmaBuf([u8; 512]);
-static mut USB_DMA_BUF: DmaBuf = DmaBuf([0u8; 512]);
+/// 512-byte Core 0 SDRAM bounce buffer (right after `PING_PONG` at `0x6010_0000..0x6012_0000`)
+/// so `DMAC0 CH1` never targets `SRAM0` (`0x2000_xxxx`), matching `mc-1r1` SDRAM DMA.
+const USB_DMA_BUF_SDRAM: usize = 0x6012_0000;
 
 // Interrupt-driven wakers & shared hardware state
 static BUS_WAKER: AtomicWaker = AtomicWaker::new();
@@ -152,7 +151,7 @@ const fn ep_out_len_addr(ep: usize) -> usize {
 #[inline(always)]
 fn is_dmac_accessible_aligned(ptr: *const u8) -> bool {
     let a = ptr as usize;
-    (a & 3) == 0 && (a >= 0x2000_0000)
+    (a & 3) == 0 && (0x6000_0000..0x6100_0000).contains(&a)
 }
 
 unsafe fn nvic_enable_irq(irq: usize, prio: u8) {
@@ -257,7 +256,7 @@ unsafe fn dma_write_fifo(fifo_addr: usize, buf: &[u8]) {
     let src_ptr = if is_dmac_accessible_aligned(buf.as_ptr()) {
         buf.as_ptr() as u32
     } else {
-        let dst = (&raw mut USB_DMA_BUF.0) as *mut u8;
+        let dst = USB_DMA_BUF_SDRAM as *mut u8;
         core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, len);
         dst as u32
     };
@@ -302,7 +301,7 @@ unsafe fn dma_read_fifo(fifo_addr: usize, buf: &mut [u8]) {
     let dst_ptr = if direct {
         buf.as_mut_ptr() as u32
     } else {
-        (&raw mut USB_DMA_BUF.0) as u32
+        USB_DMA_BUF_SDRAM as u32
     };
 
     let words = len >> 2;
@@ -337,7 +336,7 @@ unsafe fn dma_read_fifo(fifo_addr: usize, buf: &mut [u8]) {
     dsb();
 
     if !direct {
-        let src = (&raw const USB_DMA_BUF.0) as *const u8;
+        let src = USB_DMA_BUF_SDRAM as *const u8;
         core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), len);
     }
 }
@@ -413,6 +412,11 @@ pub unsafe extern "C" fn USB_IRQ_Handler() {
         EP0_WAKER.wake();
     }
 
+    if (pending & INT_SOF) != 0 {
+        wr32(USB_CFG, rd32(USB_CFG) | INT_SOF);
+        wr32(USB_INT_STAT, !INT_SOF);
+    }
+
     if (pending & INT_SET_CONFIG) != 0 {
         wr32(USB_INT_STAT, !INT_SET_CONFIG);
         USB_SUSPENDED.store(false, Ordering::Release);
@@ -421,7 +425,7 @@ pub unsafe extern "C" fn USB_IRQ_Handler() {
         EP0_WAKER.wake();
     }
 
-    // Clear SUSPEND / RESUME / SET_IFACE in hardware (W0C). Do NOT emit Event::Suspend to
+    // Clear SUSPEND / RESUME in hardware (W0C). Do NOT emit Event::Suspend to
     // embassy-usb: embassy-usb exits run_until_suspend() on Event::Suspend and stops polling
     // ControlPipe::setup() (EP0), which causes Linux usb-storage GET_MAX_LUN to time out for 10s!
     if (pending & INT_SUSPEND) != 0 {
@@ -431,9 +435,6 @@ pub unsafe extern "C" fn USB_IRQ_Handler() {
     if (pending & INT_RESUME) != 0 {
         wr32(USB_INT_STAT, !INT_RESUME);
         USB_SUSPENDED.store(false, Ordering::Release);
-    }
-    if (pending & INT_SET_IFACE) != 0 {
-        wr32(USB_INT_STAT, !INT_SET_IFACE);
     }
 
     // Clear any pending misc/stall/clear-halt status bits in 0x4006_217C (W0C: App0_UPD 0x6001_F6D2).
@@ -694,7 +695,8 @@ impl Bus for BmcBus {
 
         unsafe {
             wr32(USB_CFG, rd32(USB_CFG) | 0x0080_0000);
-            wr32(USB_CFG, rd32(USB_CFG) & 0x80FF_BFFF);
+            // Match BootROM (0x3804) & App0_UPD (0x6001_F828): mask bit 31 (VBUS) & bit 26 (SOF).
+            wr32(USB_CFG, (rd32(USB_CFG) | 0x8400_0000) & 0x84FF_BFFF);
             wr32(USB_CTRL, (rd32(USB_CTRL) & !3) | 2);
             wr32(USB_INT_STAT, 0); // Clear all latched W0C global IRQ flags (App0_UPD 0x6001_F4EE)
             dsb();

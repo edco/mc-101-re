@@ -33,7 +33,10 @@ unsafe fn ch7_write_byte(rs_data: bool, byte: u8) {
 
     // Gate on TX FIFO level ([0x4002_2C18] & 0xFF <= 0x3C).
     let fifo_reg = (LCD_CH7_BASE + 0x18) as *const u32;
-    while (core::ptr::read_volatile(fifo_reg) & 0xFF) > 0x3C {
+    for _ in 0..100_000u32 {
+        if (core::ptr::read_volatile(fifo_reg) & 0xFF) <= 0x3C {
+            break;
+        }
         core::hint::spin_loop();
     }
 
@@ -43,11 +46,12 @@ unsafe fn ch7_write_byte(rs_data: bool, byte: u8) {
     // Wait for status bit 8 (0x100) then bit 9 (0x200) in 0x4002_2C04
     // (verified from 0x6000_39CC: `lsls r1, #0x17; bpl` and `lsls r1, #0x16; bpl`).
     let status_reg = (LCD_CH7_BASE + 0x04) as *const u32;
-    loop {
+    for _ in 0..100_000u32 {
         let st = core::ptr::read_volatile(status_reg);
         if (st & 0x100) != 0 && (st & 0x200) != 0 {
             break;
         }
+        core::hint::spin_loop();
     }
 }
 
